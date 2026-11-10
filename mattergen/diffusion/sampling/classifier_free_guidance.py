@@ -1,12 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
-from typing import Callable
+import math
+from typing import Any, Callable
 
 import torch
 
 from mattergen.diffusion.sampling.pc_sampler import Diffusable, PredictorCorrector
 from mattergen.common.data.collate import collate
+from mattergen.diffusion.wrapped.wrapped_sde import WrappedSDEMixin
 
 BatchTransform = Callable[[Diffusable], Diffusable]
 
@@ -16,6 +18,80 @@ def identity(x: Diffusable) -> Diffusable:
     Default function that transforms data to its conditional state
     """
     return x
+
+
+def _gaussian_logp_per_row(
+    sample: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    boundary: float | None = None,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Per-row Gaussian log-density, summed over all non-batch dims.
+
+    Args:
+        sample: realized value, shape [num_rows, ...].
+        mean: predicted mean, same shape as sample.
+        std: standard deviation, broadcastable to sample.
+        boundary: period of a wrapped field; the displacement is reduced to its minimum image.
+        eps: floor on std.
+
+    Returns:
+        Tensor of shape [num_rows].
+    """
+    std = torch.clamp(std, min=eps)
+    diff = sample - mean
+    if boundary is not None:
+        diff = diff - boundary * torch.round(diff / boundary)
+    diff = diff / std
+    reduce_dims = tuple(range(1, sample.ndim))
+    n = sample[0].numel() if sample.ndim > 1 else 1
+    return (
+        -0.5 * (diff * diff).sum(dim=reduce_dims)
+        - torch.log(std).sum(dim=reduce_dims)
+        - 0.5 * math.log(2.0 * math.pi) * n
+    )
+
+
+def _symmetric_gaussian_logp_per_sample(
+    sample: torch.Tensor,
+    mean: torch.Tensor,
+    std: torch.Tensor,
+    eps: float = 1e-12,
+    symmetry_atol: float = 1e-5,
+) -> torch.Tensor:
+    """Gaussian log-density on the six independent coordinates of a symmetric lattice."""
+    if sample.ndim != 3 or sample.shape[1:] != (3, 3):
+        raise ValueError(f"Expected lattice sample shape [B, 3, 3], got {tuple(sample.shape)}")
+    if mean.shape != sample.shape:
+        raise ValueError(
+            f"Expected lattice mean shape {tuple(sample.shape)}, got {tuple(mean.shape)}"
+        )
+    for name, value in (("sample", sample), ("mean", mean)):
+        if not torch.allclose(
+            value,
+            value.transpose(1, 2),
+            atol=symmetry_atol,
+            rtol=0.0,
+        ):
+            maximum = torch.max(torch.abs(value - value.transpose(1, 2))).item()
+            raise ValueError(
+                f"Lattice {name} is not symmetric within atol={symmetry_atol:g}; "
+                f"maximum asymmetry={maximum:g}"
+            )
+
+    rows = torch.tensor([0, 0, 0, 1, 1, 2], device=sample.device)
+    cols = torch.tensor([0, 1, 2, 1, 2, 2], device=sample.device)
+    std_matrix = torch.broadcast_to(torch.clamp(std, min=eps), sample.shape)
+    sample_coordinates = sample[:, rows, cols]
+    mean_coordinates = mean[:, rows, cols]
+    std_coordinates = std_matrix[:, rows, cols]
+    standardized = (sample_coordinates - mean_coordinates) / std_coordinates
+    return (
+        -0.5 * torch.square(standardized).sum(dim=1)
+        - torch.log(std_coordinates).sum(dim=1)
+        - 0.5 * math.log(2.0 * math.pi) * sample_coordinates.shape[1]
+    )
 
 
 class GuidedPredictorCorrector(PredictorCorrector):
@@ -98,3 +174,376 @@ class GuidedPredictorCorrector(PredictorCorrector):
                     for k in self._multi_corruption.corrupted_fields
                 }
             )
+
+    def _score_pair(
+        self,
+        *,
+        x: Diffusable,
+        t: torch.Tensor,
+    ) -> tuple[Diffusable, Diffusable]:
+        """
+        Return (unconditional_score, conditional_score) in one forward pass (for CFG).
+        """
+        batch_no_condition = self._remove_conditioning_fn(x)
+        batch_with_condition = self._keep_conditioning_fn(x)
+        joint_batch = collate([batch_no_condition, batch_with_condition])
+
+        for attr, value in batch_no_condition.items():
+            if isinstance(value, list):
+                joint_batch[attr] = batch_no_condition[attr] + batch_with_condition[attr]
+
+        combined_score = super(GuidedPredictorCorrector, self)._score_fn(
+            x=joint_batch, t=torch.cat([t, t], dim=0)
+        )
+        unconditional_score = combined_score[0]
+        conditional_score = combined_score[1]
+        return unconditional_score, conditional_score
+
+    @torch.no_grad()
+    def _denoise_one_step_with_logp_pair(
+        self,
+        batch: Diffusable,
+        mask: dict[str, torch.Tensor],
+        timestep_i: int,
+        *,
+        record: bool = False,
+        include_lattice_logp: bool = False,
+        eps: float = 1e-12,
+    ) -> tuple[Diffusable, Diffusable, list[Diffusable] | None, dict[str, torch.Tensor]]:
+        """Like `_denoise_one_step`, but also returns per-sample log-probabilities of the
+        realized transition under the guided (CFG) kernel and the unconditional kernel.
+
+        Langevin corrector steps are scored only with `use_empirical_stepsize=True`, where
+        the step size is deterministic. Lattice fields are scored only when
+        `include_lattice_logp` is true, using the pre-polar corrector latent.
+
+        Returns:
+            (batch, mean_batch, recorded_samples, info), where info holds
+            "logp_guided" and "logp_uncond", each of shape [B].
+        """
+        from torch_scatter import scatter_add
+
+        from mattergen.diffusion.sampling.predictors import AncestralSamplingPredictor
+        from mattergen.diffusion.sampling.predictors_correctors import (
+            LangevinCorrector,
+            empirical_step_size as base_empirical_step_size,
+        )
+        from mattergen.diffusion.corruption.multi_corruption import apply as multi_apply
+        from mattergen.diffusion.corruption.corruption import maybe_expand
+        from mattergen.diffusion.sampling.pc_sampler import _mask_replace
+        from mattergen.common.diffusion.predictors_correctors import (
+            LatticeLangevinDiffCorrector,
+            empirical_step_size as lattice_empirical_step_size,
+        )
+        from mattergen.diffusion.d3pm.d3pm_predictors_correctors import (
+            D3PMAncestralSamplingPredictor,
+        )
+        from mattergen.diffusion.discrete_time import to_discrete_time
+        from mattergen.common.diffusion.corruption import LatticeVPSDE
+
+        if isinstance(self._diffusion_module, torch.nn.Module):
+            self._diffusion_module.eval()
+
+        recorded_samples = None
+        if record:
+            recorded_samples = []
+
+        for k in self._predictors:
+            mask.setdefault(k, None)
+        for k in self._correctors:
+            mask.setdefault(k, None)
+
+        mean_batch = batch.clone()
+
+        timesteps = torch.linspace(self._max_t, self._eps_t, self.N, device=self._device)
+        dt = -torch.tensor((self._max_t - self._eps_t) / (self.N - 1)).to(self._device)
+        t = torch.full((batch.get_batch_size(),), timesteps[timestep_i], device=self._device)
+
+        B = batch.get_batch_size()
+        logp_guided = torch.zeros((B,), device=self._device, dtype=torch.float32)
+        logp_uncond = torch.zeros((B,), device=self._device, dtype=torch.float32)
+
+        if self._correctors:
+            for _ in range(self._n_steps_corrector):
+                for _, corrector in self._correctors.items():
+                    if isinstance(corrector, LangevinCorrector):
+                        assert corrector.use_empirical_stepsize, (
+                            "Corrector log-prob requires use_empirical_stepsize=True."
+                        )
+                uncond_score, cond_score = self._score_pair(x=batch, t=t)
+                guided_score = uncond_score.replace(
+                    **{
+                        k: torch.lerp(
+                            uncond_score[k], cond_score[k], self._guidance_scale
+                        )
+                        for k in self._multi_corruption.corrupted_fields
+                    }
+                )
+                x_pre_corrector: dict[str, torch.Tensor] = {
+                    k: batch[k].clone() for k in self._correctors
+                }
+                lattice_corrector_latents: dict[str, torch.Tensor] = {}
+
+                def _corrector_fn(
+                    field_name: str,
+                    corrector: Any,
+                ) -> Callable[..., tuple[torch.Tensor, torch.Tensor]]:
+                    if (
+                        not include_lattice_logp
+                        or not isinstance(corrector, LatticeLangevinDiffCorrector)
+                    ):
+                        return corrector.step_given_score
+
+                    def _step_and_retain_latent(
+                        **kwargs: Any,
+                    ) -> tuple[torch.Tensor, torch.Tensor]:
+                        sample, mean, latent = corrector.step_given_score_with_latent(**kwargs)
+                        lattice_corrector_latents[field_name] = latent
+                        return sample, mean
+
+                    return _step_and_retain_latent
+
+                fns = {
+                    k: _corrector_fn(k, corrector)
+                    for k, corrector in self._correctors.items()
+                }
+                samples_means = multi_apply(
+                    fns=fns,
+                    broadcast={"t": t, "dt": dt},
+                    x=batch,
+                    score=guided_score,
+                    batch_idx=self._multi_corruption._get_batch_indices(batch),
+                )
+                if record:
+                    recorded_samples.append(batch.clone().to("cpu"))
+                batch, mean_batch = _mask_replace(
+                    samples_means=samples_means, batch=batch, mean_batch=mean_batch, mask=mask
+                )
+                batch_indices = self._multi_corruption._get_batch_indices(batch)
+                for field_name, corrector in self._correctors.items():
+                    if not isinstance(corrector, LangevinCorrector):
+                        continue
+                    if isinstance(corrector.corruption, LatticeVPSDE):
+                        if not include_lattice_logp:
+                            continue
+                        if mask.get(field_name) is not None:
+                            continue
+                        step_size = lattice_empirical_step_size(t)
+                        step_size = maybe_expand(
+                            step_size,
+                            batch_indices[field_name],
+                            guided_score[field_name],
+                        )
+                        std = torch.sqrt(torch.clamp(step_size * 2, min=eps))
+                        mean_g = (
+                            x_pre_corrector[field_name]
+                            + step_size * guided_score[field_name]
+                        )
+                        mean_u = (
+                            x_pre_corrector[field_name]
+                            + step_size * uncond_score[field_name]
+                        )
+                        latent = lattice_corrector_latents.get(field_name)
+                        if latent is None:
+                            raise RuntimeError(
+                                f"Missing pre-polar latent for lattice corrector {field_name!r}."
+                            )
+                        logp_guided = logp_guided + _symmetric_gaussian_logp_per_sample(
+                            latent, mean_g, std, eps=eps
+                        )
+                        logp_uncond = logp_uncond + _symmetric_gaussian_logp_per_sample(
+                            latent, mean_u, std, eps=eps
+                        )
+                        continue
+                    if field_name not in batch_indices:
+                        continue
+                    if batch_indices[field_name] is None:
+                        continue
+                    if mask.get(field_name) is not None:
+                        continue
+
+                    if isinstance(corrector, LatticeLangevinDiffCorrector):
+                        step_size = lattice_empirical_step_size(t)
+                    else:
+                        step_size = base_empirical_step_size(t)
+                    step_size = maybe_expand(step_size, batch_indices[field_name], guided_score[field_name])
+                    std = torch.sqrt(torch.clamp(step_size * 2, min=eps))
+
+                    mean_g = x_pre_corrector[field_name] + step_size * guided_score[field_name]
+                    mean_u = x_pre_corrector[field_name] + step_size * uncond_score[field_name]
+                    sample = batch[field_name]
+
+                    _corruption = corrector.corruption
+                    _boundary = _corruption.wrapping_boundary if isinstance(_corruption, WrappedSDEMixin) else None
+                    lp_g_rows = _gaussian_logp_per_row(sample, mean_g, std, boundary=_boundary)
+                    lp_u_rows = _gaussian_logp_per_row(sample, mean_u, std, boundary=_boundary)
+                    bidx = batch_indices[field_name]
+                    logp_guided = logp_guided + scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
+                    logp_uncond = logp_uncond + scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
+
+        uncond_score, cond_score = self._score_pair(x=batch, t=t)
+        next_t = t + dt
+        # The terminal predictor is deterministic: score it under the unconditional kernel
+        # for both proposal and target so its ratio is one.
+        shared_final_predictor = include_lattice_logp and bool(
+            torch.all(next_t <= 0).item()
+        )
+        if shared_final_predictor:
+            guided_score = uncond_score
+        else:
+            guided_score = (
+                cond_score
+                if abs(self._guidance_scale - 1) < 1e-15
+                else (
+                    uncond_score
+                    if abs(self._guidance_scale) < 1e-15
+                    else uncond_score.replace(
+                        **{
+                            k: torch.lerp(
+                                uncond_score[k], cond_score[k], self._guidance_scale
+                            )
+                            for k in self._multi_corruption.corrupted_fields
+                        }
+                    )
+                )
+            )
+
+        x_pre: dict[str, torch.Tensor] = {k: batch[k].clone() for k in self._predictors}
+
+        predictor_fns = {k: predictor.update_given_score for k, predictor in self._predictors.items()}
+        samples_means = multi_apply(
+            fns=predictor_fns,
+            x=batch,
+            score=guided_score,
+            broadcast=dict(t=t, batch=batch, dt=dt),
+            batch_idx=self._multi_corruption._get_batch_indices(batch),
+        )
+        if record:
+            recorded_samples.append(batch.clone().to("cpu"))
+        batch, mean_batch = _mask_replace(
+            samples_means=samples_means, batch=batch, mean_batch=mean_batch, mask=mask
+        )
+
+        batch_indices = self._multi_corruption._get_batch_indices(batch)
+        for field_name, predictor in self._predictors.items():
+            if isinstance(predictor, AncestralSamplingPredictor):
+                if isinstance(predictor.corruption, LatticeVPSDE):
+                    if not include_lattice_logp:
+                        continue
+                    if mask.get(field_name) is not None:
+                        continue
+                    batch_idx = batch_indices[field_name]
+                    x_coeff, score_coeff, std = predictor._get_coeffs(
+                        x=x_pre[field_name],
+                        t=t,
+                        dt=dt,
+                        batch_idx=batch_idx,
+                        batch=batch,
+                    )
+                    mean_coeff = 1 - x_coeff
+                    limit_mean = predictor.corruption.get_limit_mean(
+                        x=x_pre[field_name], batch=batch
+                    )
+                    mean_g = (
+                        x_coeff * x_pre[field_name]
+                        + score_coeff * guided_score[field_name]
+                        + mean_coeff * limit_mean
+                    )
+                    mean_u = (
+                        x_coeff * x_pre[field_name]
+                        + score_coeff * uncond_score[field_name]
+                        + mean_coeff * limit_mean
+                    )
+                    sample = batch[field_name]
+                    lp_g = _symmetric_gaussian_logp_per_sample(
+                        sample, mean_g, std, eps=eps
+                    )
+                    lp_u = _symmetric_gaussian_logp_per_sample(
+                        sample, mean_u, std, eps=eps
+                    )
+                    if lp_g.shape != (B,) or lp_u.shape != (B,):
+                        raise RuntimeError(
+                            "Lattice predictor log probabilities must have shape "
+                            f"[{B}], got {tuple(lp_g.shape)} and {tuple(lp_u.shape)}."
+                        )
+                    if not shared_final_predictor:
+                        logp_guided = logp_guided + lp_g
+                        logp_uncond = logp_uncond + lp_u
+                    continue
+                if field_name not in batch_indices:
+                    continue
+                if batch_indices[field_name] is None:
+                    continue
+                if mask.get(field_name) is not None:
+                    continue
+
+                x_coeff, score_coeff, std = predictor._get_coeffs(  # pylint: disable=protected-access
+                    x=x_pre[field_name],
+                    t=t,
+                    dt=dt,
+                    batch_idx=batch_indices[field_name],
+                    batch=batch,
+                )
+
+                sample = batch[field_name]
+                mean_g = x_coeff * x_pre[field_name] + score_coeff * guided_score[field_name]
+                mean_u = x_coeff * x_pre[field_name] + score_coeff * uncond_score[field_name]
+
+                _corruption = predictor.corruption
+                _boundary = _corruption.wrapping_boundary if isinstance(_corruption, WrappedSDEMixin) else None
+                lp_g_rows = _gaussian_logp_per_row(sample, mean_g, std, boundary=_boundary)
+                lp_u_rows = _gaussian_logp_per_row(sample, mean_u, std, boundary=_boundary)
+
+                bidx = batch_indices[field_name]
+                if not shared_final_predictor:
+                    logp_guided = logp_guided + scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
+                    logp_uncond = logp_uncond + scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
+            elif isinstance(predictor, D3PMAncestralSamplingPredictor):
+                if field_name not in batch_indices:
+                    continue
+                if batch_indices[field_name] is None:
+                    continue
+                if mask.get(field_name) is not None:
+                    continue
+
+                corruption = predictor.corruption
+                bidx = batch_indices[field_name]
+                t_discrete = to_discrete_time(t=t, N=predictor.N, T=corruption.T)
+                t_per_atom = t_discrete[bidx].to(torch.long)
+                x_pre_zero_based = corruption._to_zero_based(x_pre[field_name])
+
+                def _posterior_logits(raw_logits: torch.Tensor) -> torch.Tensor:
+                    class_probs = torch.softmax(raw_logits, dim=-1)
+                    if predictor.predict_x0:
+                        logits, _ = corruption.d3pm.sample_and_compute_posterior_q(
+                            x_0=class_probs,
+                            t=t_per_atom,
+                            make_one_hot=False,
+                            samples=x_pre_zero_based,
+                            return_logits=True,
+                        )
+                        return logits
+                    return raw_logits
+
+                realized_zero_based = corruption._to_zero_based(batch[field_name]).long()
+
+                logits_g = _posterior_logits(guided_score[field_name])
+                logits_u = _posterior_logits(uncond_score[field_name])
+
+                lp_g_rows = torch.distributions.Categorical(logits=logits_g).log_prob(
+                    realized_zero_based
+                )
+                lp_u_rows = torch.distributions.Categorical(logits=logits_u).log_prob(
+                    realized_zero_based
+                )
+
+                if not shared_final_predictor:
+                    logp_guided = logp_guided + scatter_add(lp_g_rows, index=bidx, dim=0, dim_size=B)
+                    logp_uncond = logp_uncond + scatter_add(lp_u_rows, index=bidx, dim=0, dim_size=B)
+        if not include_lattice_logp and timestep_i >= 999:
+            logp_uncond = logp_guided
+        info: dict[str, torch.Tensor] = {
+            "logp_guided": logp_guided,
+            "logp_uncond": logp_uncond,
+        }
+        return batch, mean_batch, recorded_samples, info
