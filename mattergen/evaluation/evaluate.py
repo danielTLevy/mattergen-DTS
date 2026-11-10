@@ -1,12 +1,14 @@
 # Copyright (c) Microsoft Corporation.
 # Licensed under the MIT License.
 
+import json
+import os
 from pymatgen.core.structure import Structure
 
 from mattergen.common.utils.globals import get_device
 from mattergen.evaluation.metrics.evaluator import MetricsEvaluator
 from mattergen.evaluation.reference.reference_dataset import ReferenceDataset
-from mattergen.evaluation.utils.relaxation import relax_structures
+from mattergen.evaluation.utils.relaxation import relax_structures, get_total_energies
 from mattergen.evaluation.utils.structure_matcher import (
     DefaultDisorderedStructureMatcher,
     DisorderedStructureMatcher,
@@ -26,6 +28,7 @@ def evaluate(
     potential_load_path: str | None = None,
     device: str = str(get_device()),
     structures_output_path: str | None = None,
+    save_sun_structures: str | None = None,
 ) -> dict[str, float | int]:
     """Evaluate the structures against a reference dataset.
 
@@ -39,6 +42,7 @@ def evaluate(
         potential_load_path: Path to the Machine Learning potential to use for relaxation.
         device: Device to use for relaxation.
         structures_output_path: Path to save the relaxed structures.
+        save_sun_structures: Directory to save the stable, unique, and novel (SUN) structures.
 
     Returns:
         metrics: a dictionary of metrics and their values.
@@ -51,6 +55,10 @@ def evaluate(
         )
     else:
         relaxed_structures = structures
+        if energies is None:
+            energies = get_total_energies(
+                structures, device=device, potential_load_path=potential_load_path
+            )
     evaluator = MetricsEvaluator.from_structures_and_energies(
         structures=relaxed_structures,
         energies=energies,
@@ -58,8 +66,35 @@ def evaluate(
         reference=reference,
         structure_matcher=structure_matcher,
     )
-    return evaluator.compute_metrics(
+    compute_metrics_out = evaluator.compute_metrics(
         metrics=evaluator.available_metrics,
         save_as=save_as,
         pretty_print=True,
     )
+
+    if save_sun_structures:
+        sun_mask = evaluator.is_unique & evaluator.is_stable & evaluator.is_novel
+        sun_structures = evaluator.filter(structures, sun_mask)
+        sun_structures = [s for s in sun_structures if s is not None]
+        if not os.path.exists(save_sun_structures):
+            os.makedirs(save_sun_structures)
+        original_indices = [i for i, m in enumerate(sun_mask) if m]
+        index_mapping = {orig: sun for sun, orig in enumerate(original_indices)}
+        structure_sun_info = {
+            i: {
+                "energy": float(energies[i]),
+                "is_stable": bool(evaluator.is_stable[i]),
+                "is_unique": bool(evaluator.is_unique[i]),
+                "is_novel": bool(evaluator.is_novel[i]),
+                "sun_index": index_mapping.get(i),
+            }
+            for i in range(len(structures))
+        }
+        with open(os.path.join(save_sun_structures, "structure_sun_info.json"), "w") as f:
+            json.dump(structure_sun_info, f, indent=2)
+        if len(sun_structures) > 0:
+            with open(os.path.join(save_sun_structures, "sun_index_mapping.json"), "w") as f:
+                json.dump(index_mapping, f)
+            for i, s in enumerate(sun_structures):
+                s.to(filename=os.path.join(save_sun_structures, f"sun_structure_{i}.cif"))
+    return compute_metrics_out

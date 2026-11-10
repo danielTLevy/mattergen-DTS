@@ -153,7 +153,7 @@ def load_structures(input_path: Path) -> Sequence[Structure]:
 
 def extract_structures_from_folder(dirname: str) -> Sequence[Structure]:
     structures = []
-    for filename in os.listdir(dirname):
+    for filename in sorted(os.listdir(dirname)):
         if filename.endswith(".cif"):
             try:
                 structures.append(Structure.from_file(f"{dirname}/{filename}"))
