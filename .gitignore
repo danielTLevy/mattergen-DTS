@@ -399,3 +399,9 @@ FodyWeavers.xsd
 
 # Virtual environment
 .venv/
+# MaterialDTS
+*.egg-info/
+datasets/*
+!datasets/.gitattributes
+outputs/
+lightning_logs/
